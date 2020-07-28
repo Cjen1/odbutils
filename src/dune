@@ -1,0 +1,4 @@
+(library
+ (name odbutils)
+ (public_name odbutils)
+ (libraries lwt lwt.unix logs logs.fmt fmt.tty))

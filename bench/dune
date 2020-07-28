@@ -1,0 +1,3 @@
+(executables
+ (names bench_wal)
+ (libraries core owl odbutils))
