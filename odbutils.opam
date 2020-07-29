@@ -10,6 +10,8 @@ depends: [
   "logs"
   "fmt"
   "base"
+  "mirage-block"
+  "mirage-block-unix"
 ]
 build: [
   ["dune" "subst"] {pinned}

@@ -13,5 +13,7 @@
     logs
     fmt
     base
+    mirage-block
+    mirage-block-unix
     ))
 

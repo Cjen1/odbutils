@@ -1,4 +1,3 @@
-
 (* [src] is the logging source for the batcher *)
 val src : Logs.Src.t
 

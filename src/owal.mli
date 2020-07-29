@@ -12,10 +12,8 @@ module type Persistable = sig
   val apply : t -> op -> t
 end
 
-type batch
-
 module Persistant (P : Persistable) : sig
-  type t = {t: P.t; batch: batch}
+  type t
 
   type op = P.op
 
@@ -26,4 +24,6 @@ module Persistant (P : Persistable) : sig
   val change : op -> t -> t
 
   val close : t -> unit Lwt.t
+
+  val get_underlying : t -> P.t
 end

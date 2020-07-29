@@ -34,38 +34,38 @@ let time_it f =
 
 let test_file = "test.tmp"
 
-type test_res = {throughput: float;latencies: float array}
+type test_res = {throughput: float; latencies: float array}
 
 let throughput n =
   Log.info (fun m -> m "Setting up throughput test") ;
   T.of_file test_file
   >>= fun t ->
-  let stream =
-    List.init n (fun _ -> Random.int 100000)
-    |> Lwt_stream.of_list
-  in
+  let stream = List.init n (fun _ -> Random.int 100) |> Lwt_stream.of_list in
   let result_q = Queue.create () in
   let test () =
     Lwt_stream.fold_s
       (fun v t ->
-         let start = Unix.gettimeofday () in
-         let t = T.change (T_p.Write v) t in
-         T.sync t |> Lwt_result.get_exn >>= fun () ->
-         let lat = Unix.gettimeofday () -. start in
-         Queue.add lat result_q;
-         Lwt.return t
-      )
-      stream
-      t >>= fun _ -> Lwt.return_unit
+        Lwt.pause ()
+        >>= fun () ->
+        let start = Unix.gettimeofday () in
+        let t = T.change (T_p.Write v) t in
+        T.sync t |> Lwt_result.get_exn
+        >>= fun () ->
+        let lat = Unix.gettimeofday () -. start in
+        Queue.add lat result_q ; Lwt.return t)
+      stream t
+    >>= fun _ -> Lwt.return_unit
   in
   Log.info (fun m -> m "Starting throughput test") ;
   time_it test
   >>= fun time ->
   Log.info (fun m -> m "Finished throughput test!") ;
   let throughput = Base.Float.(of_int n / time) in
-  remove test_file;
+  remove test_file ;
   Lwt.return
-    {throughput;latencies=Queue.fold (fun ls e -> e :: ls) [] result_q|> Array.of_list}
+    { throughput
+    ; latencies= Queue.fold (fun ls e -> e :: ls) [] result_q |> Array.of_list
+    }
 
 let reporter =
   let open Core in
@@ -99,5 +99,7 @@ let pp_stats =
 let () =
   Logs.(set_level (Some Debug)) ;
   Logs.set_reporter reporter ;
-  let res = try Lwt_main.run (throughput 1000) with e -> remove test_file; raise e in
+  let res =
+    try Lwt_main.run (throughput 10) with e -> remove test_file ; raise e
+  in
   Fmt.pr "%a" pp_stats res

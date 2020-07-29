@@ -32,17 +32,18 @@ let init switch () =
   Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
       Lwt_unix.unlink test_file)
 
-let test_change_sync _ () =
+let test_change_sync_reload _ () =
   T.of_file test_file
   >>= fun t ->
   let t = List.fold_left (fun t op -> T.change op t) t op_seq in
-  Alcotest.(check @@ list int) "Apply ops to t" t.t test_seq ;
-  T.sync t >|= Result.get_ok >>= fun () -> T.close t
-
-let test_reload _ () =
+  Alcotest.(check @@ list int) "Apply ops to t" test_seq (T.get_underlying t) ;
+  T.sync t >|= Result.get_ok
+  >>= fun () ->
+  T.close t
+  >>= fun () ->
   T.of_file test_file
   >>= fun t ->
-  Alcotest.(check @@ list int) "reload from file" t.t test_seq ;
+  Alcotest.(check @@ list int) "reload from file" test_seq (T.get_underlying t) ;
   T.close t
 
 let reporter =
@@ -73,5 +74,4 @@ let () =
   Lwt_main.run
   @@ run "Persistant test"
        [ ( "Basic functionality"
-         , [ test_case "Change" `Quick test_change_sync
-           ; test_case "Reload" `Quick test_reload ] ) ]
+         , [test_case "Change and reload" `Quick test_change_sync_reload] ) ]
