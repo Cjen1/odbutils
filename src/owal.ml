@@ -24,15 +24,16 @@ module Persistant (P : Persistable) = struct
   type t =
     { t: P.t
     ; batcher: (int * (bytes -> offset:int -> unit)) Batcher.t
+    ; batch_fn : (int * (bytes -> offset:int -> unit)) list -> unit Lwt.t
     ; fd: Lwt_unix.file_descr
     ; prev: unit Lwt.t ref }
 
   let write_batch prev_ref fd bs =
     let base_write fd bs =
-      let size_max =
+      let total_size =
         List.fold_left (fun acc (p_len, _p_blit) -> acc + p_len + 8) 0 bs
       in
-      let buf = Bytes.create size_max in
+      let buf = Bytes.create total_size in
       let size =
         List.fold_left
           (fun offset (p_len, p_blit) ->
@@ -42,7 +43,7 @@ module Persistant (P : Persistable) = struct
             offset + p_len + 8)
           0 bs
       in
-      assert (size = size_max) ;
+      assert (size = total_size) ;
       let rec loop offset size =
         Lwt_unix.write fd buf offset size
         >>= fun written ->
@@ -65,14 +66,14 @@ module Persistant (P : Persistable) = struct
 
   let write t v =
     let p_len, p_blit = P.encode_blit v in
-    let p = Batcher.auto_dispatch t.batcher (p_len, p_blit) in
+    let p = Batcher.auto_dispatch t.batcher (p_len, p_blit) t.batch_fn in
     Lwt.on_failure p !Lwt.async_exception_hook ;
     t
 
   let sync t =
-    Batcher.perform t.batcher
+    Batcher.perform t.batcher t.batch_fn
     >>= fun () ->
-    Lwt_unix.fsync t.fd
+    Lwt_unix.fdatasync t.fd
     >>= fun () ->
     (* All pending writes now complete *)
     Logs.debug (fun m -> m "Finished syncing") ;
@@ -114,9 +115,9 @@ module Persistant (P : Persistable) = struct
     Lwt_unix.openfile file Lwt_unix.[O_WRONLY; O_APPEND] 0o640
     >>= fun fd ->
     let prev = ref Lwt.return_unit in
-    let handler = write_batch prev fd in
-    let batcher = Batcher.create 1 handler in
-    Lwt.return {t; batcher; fd; prev}
+    let batch_fn = write_batch prev fd in
+    let batcher = Batcher.create 1 in
+    Lwt.return {t; batcher; batch_fn; fd; prev}
 
   let change op t = {(write t op) with t= P.apply t.t op}
 
@@ -127,6 +128,10 @@ module Persistant (P : Persistable) = struct
         Log.err (fun m -> m "Error on closing batch %a" Fmt.exn exn) ;
         Lwt.return_unit
     | Ok () ->
+        Lwt_unix.fsync t.fd
+        >>= fun () ->
+        Lwt_unix.close t.fd
+        >>= fun () ->
         Log.info (fun m -> m "Closed wal successfully") ;
         Lwt.return_unit
 

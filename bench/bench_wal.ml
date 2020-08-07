@@ -97,7 +97,7 @@ let pp_stats =
   record fields
 
 let () =
-  Logs.(set_level (Some Debug)) ;
+  Logs.(set_level (Some Info)) ;
   Logs.set_reporter reporter ;
   let res =
     try Lwt_main.run (throughput 10) with e -> remove test_file ; raise e
