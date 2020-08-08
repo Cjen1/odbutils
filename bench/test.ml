@@ -1,9 +1,31 @@
-let main lwt = 
-  let count = 10 in
+open Lwt.Infix
+open Odbutils.Owal
+
+module T_p = struct
+  type t = int list
+
+  let init () = []
+
+  type op = Write of int
+
+  let encode_blit = function
+    | Write i ->
+        ( 8
+        , fun buf ~offset ->
+            EndianBytes.LittleEndian.set_int64 buf offset (Int64.of_int i) )
+
+  let decode buf ~offset =
+    Write (EndianBytes.LittleEndian.get_int64 buf offset |> Int64.to_int)
+
+  let apply t (Write i) = i :: t
+end
+
+module T = Persistant (T_p)
+
+let main () = 
+  let count = 1000 in
   let file = "bench.dat" in
   let size = 8 in
-
-  let fsync = false in
 
   let buf = Bytes.create size in
   let () = 
@@ -18,19 +40,11 @@ let main lwt =
   Unix.fsync fd;
   let duration =
       let fd = Lwt_unix.of_unix_file_descr fd in
-      let open Lwt.Infix in
       let rec loop = function
         | 0 -> 
           Lwt.return_unit
         | count ->
-          Lwt_unix.write fd buf 0 size >>= fun written ->
-          assert(written = size);
-          (
-            if fsync then
-              Lwt_unix.fsync fd
-            else
-              Lwt_unix.fdatasync fd
-          )
+          T.do_one_cycle fd buf
           >>= fun () ->
           loop (count - 1)
       in 
@@ -41,6 +55,6 @@ let main lwt =
       in
       Lwt_main.run (run ())
   in 
-  Fmt.pr "Took %.3fms per write for %s\n" ((duration /. Float.of_int count) *. 1000.) (if lwt then "lwt" else "straight") 
+  Fmt.pr "Took %.3fms per write" ((duration /. Float.of_int count) *. 1000.)
 
-let () = main false; main true
+let () = main ()

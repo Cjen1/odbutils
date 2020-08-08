@@ -103,15 +103,11 @@ module Persistant (P : Persistable) = struct
     Logs.debug (fun m -> m "Finished syncing") ;
     Lwt.return_ok ()
 
-  let buf = 
-    let b = Bytes.create 512 in
-    Bytes.fill b 0 512 't';
-    b
-
-  let do_one_cycle t =
-    Lwt_unix.write t.fd buf 0 512 >>= fun written ->
-    assert(written = 512);
-    Lwt_unix.fdatasync t.fd
+  let do_one_cycle fd buf =
+    let size = Bytes.length buf in
+    Lwt_unix.write fd buf 0 size >>= fun written ->
+    assert(written = size);
+    Lwt_unix.fdatasync fd
 
   let read_value channel =
     let rd_buf = Bytes.create 8 in
@@ -153,7 +149,8 @@ module Persistant (P : Persistable) = struct
     Logs.debug (fun m -> m "Creating fd for persistance") ;
     Lwt_unix.openfile path Lwt_unix.[O_WRONLY; O_APPEND] 0o666
     >>= fun fd ->
-    Unix.LargeFile.ftruncate (Lwt_unix.unix_file_descr fd) Int64.(mul 1000L 1000L);
+    Lwt_unix.ftruncate fd (1000*1000)>>= fun () ->
+    Lwt_unix.fsync fd >>= fun () ->
     let prev = ref Lwt.return_unit in
     let batch_fn = write_batch prev fd in
     let batcher = Batcher.create 10 in
