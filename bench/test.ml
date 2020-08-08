@@ -33,6 +33,7 @@ let main () =
     assert (Unix.read fd buf 0 size = size);
     Unix.close fd
   in 
+  (*
   let fd = 
       Unix.openfile file Unix.[O_WRONLY; O_CREAT; O_TRUNC] 0o666
   in
@@ -40,21 +41,23 @@ let main () =
   Unix.fsync fd;
   let duration =
       let fd = Lwt_unix.of_unix_file_descr fd in
-      let rec loop = function
-        | 0 -> 
-          Lwt.return_unit
-        | count ->
-          T.do_one_cycle fd buf
-          >>= fun () ->
-          loop (count - 1)
-      in 
-      let run () =
-        let start = Unix.gettimeofday () in
-        loop count >|= fun () ->
-        (Unix.gettimeofday () -. start)
-      in
-      Lwt_main.run (run ())
-  in 
+     *)
+  if Sys.file_exists file then Unix.unlink file;
+  let run () =
+    T.of_file file >>= fun t -> 
+    let rec loop = function
+      | 0 -> 
+        Lwt.return_unit
+      | count ->
+        T.do_one_cycle t buf
+        >>= fun () ->
+        loop (count - 1)
+    in 
+    let start = Unix.gettimeofday () in
+    loop count >|= fun () ->
+    (Unix.gettimeofday () -. start)
+  in
+  let duration = Lwt_main.run (run ()) in
   Fmt.pr "Took %.3fms per write" ((duration /. Float.of_int count) *. 1000.)
 
 let () = main ()
