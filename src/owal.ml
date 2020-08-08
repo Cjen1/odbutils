@@ -28,7 +28,11 @@ module Persistant (P : Persistable) = struct
     ; fd: Lwt_unix.file_descr
     ; prev: unit Lwt.t ref }
 
-  let write_batch prev_ref fd bs =
+  let write_batch prev_ref fd = function
+    | [] -> 
+      Log.debug (fun m -> m "Empty batch");
+      Lwt.return_unit
+    | bs ->
     let base_write fd bs =
       let total_size =
         List.fold_left (fun acc (p_len, _p_blit) -> acc + p_len + 8) 0 bs
@@ -50,6 +54,7 @@ module Persistant (P : Persistable) = struct
         if written = size then Lwt.return_unit
         else loop (offset + written) (size - written)
       in
+      Log.debug (fun m -> m "Writing to disk");
       loop 0 size
     in
     match Lwt.state !prev_ref with
@@ -64,20 +69,49 @@ module Persistant (P : Persistable) = struct
     | Lwt.Fail exn ->
         Lwt.fail exn
 
+        (*
   let write t v =
     let p_len, p_blit = P.encode_blit v in
     let p = Batcher.auto_dispatch t.batcher (p_len, p_blit) t.batch_fn in
     Lwt.on_failure p !Lwt.async_exception_hook ;
     t
+    *)
+
+  let write t v =
+    let p_len, p_blit = P.encode_blit v in
+    let b_len = p_len + 8 in
+    let buf = Bytes.create b_len in
+    EndianBytes.LittleEndian.set_int64 buf 0 (Int64.of_int p_len);
+    p_blit buf ~offset:8;
+    Log.debug(fun m -> m "Start _write");
+    assert(Unix.write (Lwt_unix.unix_file_descr t.fd) buf 0 b_len = b_len);
+    Log.debug(fun m -> m "End _write");
+    t
 
   let sync t =
+    (*
+    Log.debug(fun m -> m "Start batch_write");
     Batcher.perform t.batcher t.batch_fn
     >>= fun () ->
+    Log.debug(fun m -> m "End batch_write");
+       *)
+    Log.debug(fun m -> m "Start fdatasync");
     Lwt_unix.fdatasync t.fd
     >>= fun () ->
+    Log.debug(fun m -> m "End fdatasync");
     (* All pending writes now complete *)
     Logs.debug (fun m -> m "Finished syncing") ;
     Lwt.return_ok ()
+
+  let buf = 
+    let b = Bytes.create 512 in
+    Bytes.fill b 0 512 't';
+    b
+
+  let do_one_cycle t =
+    Lwt_unix.write t.fd buf 0 512 >>= fun written ->
+    assert(written = 512);
+    Lwt_unix.fdatasync t.fd
 
   let read_value channel =
     let rd_buf = Bytes.create 8 in
@@ -89,9 +123,14 @@ module Persistant (P : Persistable) = struct
     Lwt_io.read_into_exactly channel payload_buf 0 size
     >>= fun () -> payload_buf |> Lwt.return
 
-  let of_file file =
+  (* Store wal in a directory filled with files, go in ascending order from 1.wal
+     Open file, ftruncate it to 1mb min then start writing to it as normal
+     When next update wouldn't fit into file, create new file which can accommodate the next update
+        truncate old file to ensure end doesn't have 0s
+   *)
+  let of_file path =
     Logs.debug (fun m -> m "Trying to open file") ;
-    Lwt_unix.openfile file Lwt_unix.[O_RDONLY; O_CREAT] 0o640
+    Lwt_unix.openfile path Lwt_unix.[O_RDONLY; O_CREAT] 0o640
     >>= fun fd ->
     let input_channel = Lwt_io.of_fd ~mode:Lwt_io.input fd in
     let stream =
@@ -112,11 +151,12 @@ module Persistant (P : Persistable) = struct
     Lwt_io.close input_channel
     >>= fun () ->
     Logs.debug (fun m -> m "Creating fd for persistance") ;
-    Lwt_unix.openfile file Lwt_unix.[O_WRONLY; O_APPEND] 0o640
+    Lwt_unix.openfile path Lwt_unix.[O_WRONLY; O_APPEND] 0o666
     >>= fun fd ->
+    Unix.LargeFile.ftruncate (Lwt_unix.unix_file_descr fd) Int64.(mul 1000L 1000L);
     let prev = ref Lwt.return_unit in
     let batch_fn = write_batch prev fd in
-    let batcher = Batcher.create 1 in
+    let batcher = Batcher.create 10 in
     Lwt.return {t; batcher; batch_fn; fd; prev}
 
   let change op t = {(write t op) with t= P.apply t.t op}

@@ -25,5 +25,7 @@ module Persistant (P : Persistable) : sig
 
   val close : t -> unit Lwt.t
 
+  val do_one_cycle : t -> unit Lwt.t 
+
   val get_underlying : t -> P.t
 end

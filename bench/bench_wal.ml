@@ -44,13 +44,18 @@ let throughput n =
   let result_q = Queue.create () in
   let test () =
     Lwt_stream.fold_s
-      (fun v t ->
-        Lwt.pause ()
-        >>= fun () ->
+      (fun _v t ->
         let start = Unix.gettimeofday () in
+        Log.debug (fun m -> m "Start write");
+        (*
         let t = T.change (T_p.Write v) t in
+        Log.debug (fun m -> m "End write");
+        Log.debug (fun m -> m "Start sync");
         T.sync t |> Lwt_result.get_exn
         >>= fun () ->
+           *)
+        T.do_one_cycle t >>= fun () ->
+        Log.debug (fun m -> m "End sync");
         let lat = Unix.gettimeofday () -. start in
         Queue.add lat result_q ; Lwt.return t)
       stream t
