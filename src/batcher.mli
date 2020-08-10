@@ -10,7 +10,8 @@ type 'a t
  * *)
 val create : int -> 'a t
 
-(* batched dispatcher*)
+(* batched dispatchers *)
+val auto_dispatch_varying : 'a t -> 'a -> int -> ('a list -> unit Lwt.t) -> unit Lwt.t
 val auto_dispatch : 'a t -> 'a -> ('a list -> unit Lwt.t) -> unit Lwt.t
 
 (* Manually dispatch *)
