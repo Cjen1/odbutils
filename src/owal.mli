@@ -15,9 +15,7 @@ end
 
 module Persistant(P: Persistable) : sig
   type t
-
   val of_dir : ?default_file_size:int -> ?batch_size:int -> string -> (t * P.t) Lwt.t
-
   val datasync : t -> unit Lwt.t
   val write : t -> P.op -> unit Lwt.t
   val close : t -> unit Lwt.t 
