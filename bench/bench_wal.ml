@@ -40,7 +40,7 @@ let test_file = "test.tmp"
 type test_res = {throughput: float; latencies: float array}
 
 let throughput n =
-  Log.info (fun m -> m "Setting up throughput test") ;
+  (Fmt.pr "Setting up throughput test\n") ;
   T.of_dir test_file
   >>= fun (t, _t_wal) ->
   let stream = List.init n (fun _ -> Random.int 100) |> Lwt_stream.of_list in
@@ -57,32 +57,16 @@ let throughput n =
       stream
     >>= fun _ -> Lwt.return_unit
   in
-  Log.info (fun m -> m "Starting throughput test") ;
+  (Fmt.pr "Starting throughput test\n") ;
   time_it test
   >>= fun time ->
-  Log.info (fun m -> m "Finished throughput test!") ;
-  let throughput = Base.Float.(of_int n / time) in
+  (Fmt.pr "Finished throughput test!\n") ;
+  let throughput = Float.(of_int n /. time) in
   remove test_file ;
   Lwt.return
     { throughput
     ; latencies= Queue.fold (fun ls e -> e :: ls) [] result_q |> Array.of_list
     }
-
-let reporter =
-  let open Core in
-  let report src level ~over k msgf =
-    let k _ = over () ; k () in
-    let src = Logs.Src.name src in
-    msgf
-    @@ fun ?header ?tags:_ fmt ->
-    Fmt.kpf k Fmt.stdout
-      ("[%a] %a %a @[" ^^ fmt ^^ "@]@.")
-      Time.pp (Time.now ())
-      Fmt.(styled `Magenta string)
-      (Printf.sprintf "%14s" src)
-      Logs_fmt.pp_header (level, header)
-  in
-  {Logs.report}
 
 (* test_res Fmt.t*)
 let pp_stats =
@@ -98,9 +82,7 @@ let pp_stats =
   record fields
 
 let () =
-  Logs.(set_level (Some Info)) ;
-  Logs.set_reporter reporter ;
   let res =
     try Lwt_main.run (throughput 10000) with e -> remove test_file ; raise e
   in
-  Fmt.pr "%a" pp_stats res
+  Fmt.pr "%a\n" pp_stats res
