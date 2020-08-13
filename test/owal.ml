@@ -1,5 +1,10 @@
 open Lwt.Infix
+
 open Odbutils.Owal
+
+let src = Logs.Src.create "Owal_test"
+
+module Log = (val Logs.src_log src : Logs.LOG)
 
 module T_p = struct
   type t = int list
@@ -22,29 +27,37 @@ end
 
 module T = Persistant (T_p)
 
-let test_file = "test.tmp"
+let test_dir = "test.wal"
 
 let test_seq = [1; 5; 2; 4]
 
 let op_seq = test_seq |> List.map (fun i -> T_p.Write i) |> List.rev
 
-let init switch () =
+let test_change_sync_reload switch () =
   Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
-      Lwt_unix.unlink test_file)
-
-let test_change_sync_reload _ () =
-  T.of_file test_file
-  >>= fun t ->
-  let t = List.fold_left (fun t op -> T.change op t) t op_seq in
-  Alcotest.(check @@ list int) "Apply ops to t" test_seq (T.get_underlying t) ;
-  T.sync t >|= Result.get_ok
+      let path = Fpath.of_string test_dir |> Result.get_ok in
+      Bos.OS.Dir.delete ~must_exist:false ~recurse:true path |> Result.get_ok; 
+      Lwt.return_unit) >>= fun () ->
+  Log.debug (fun m -> m "opening file");
+  T.of_dir ~default_file_size:28 ~batch_size:1 test_dir
+  >>= fun (t_wal, t) ->
+  Log.debug (fun m -> m "opened file, applying ops");
+  let t = List.fold_left T_p.apply t op_seq in
+  Alcotest.(check @@ list int) "reload from file" test_seq t;
+  Log.debug (fun m -> m "Writing ops");
+  List.iter (fun (T_p.Write i as op) -> 
+      Log.debug (fun m -> m "Writing %d" i);
+      T.write t_wal op |> Lwt.ignore_result) op_seq;
+  Log.debug (fun m -> m "datasync");
+  T.datasync t_wal
   >>= fun () ->
-  T.close t
+  Log.debug (fun m -> m "Closing file");
+  T.close t_wal
   >>= fun () ->
-  T.of_file test_file
-  >>= fun t ->
-  Alcotest.(check @@ list int) "reload from file" test_seq (T.get_underlying t) ;
-  T.close t
+  T.of_dir ~default_file_size:28 test_dir
+  >>= fun (t_wal, t') ->
+  Alcotest.(check @@ list int) "reload from file" t t';
+  T.close t_wal
 
 let reporter =
   let open Core in
