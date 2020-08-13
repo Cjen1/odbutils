@@ -8,10 +8,11 @@ type 'a t
  * after [limit] calls to [auto_dispatch] will run
  * [f]
  * *)
-val create : int -> ('a list -> unit Lwt.t) -> 'a t
+val create : int -> 'a t
 
-(* batched dispatcher*)
-val auto_dispatch : 'a t -> 'a -> unit Lwt.t
+(* batched dispatchers *)
+val auto_dispatch_varying : 'a t -> 'a -> int -> ('a list -> unit Lwt.t) -> unit Lwt.t
+val auto_dispatch : 'a t -> 'a -> ('a list -> unit Lwt.t) -> unit Lwt.t
 
 (* Manually dispatch *)
-val perform : 'a t -> unit Lwt.t
+val perform : 'a t -> ('a list -> unit Lwt.t) -> unit Lwt.t

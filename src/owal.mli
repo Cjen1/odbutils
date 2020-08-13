@@ -1,3 +1,4 @@
+
 module type Persistable = sig
   type t
 
@@ -12,18 +13,10 @@ module type Persistable = sig
   val apply : t -> op -> t
 end
 
-module Persistant (P : Persistable) : sig
+module Persistant(P: Persistable) : sig
   type t
-
-  type op = P.op
-
-  val sync : t -> (unit, exn) Lwt_result.t
-
-  val of_file : string -> t Lwt.t
-
-  val change : op -> t -> t
-
-  val close : t -> unit Lwt.t
-
-  val get_underlying : t -> P.t
+  val of_dir : ?default_file_size:int -> ?batch_size:int -> string -> (t * P.t) Lwt.t
+  val datasync : t -> unit Lwt.t
+  val write : t -> P.op -> unit Lwt.t
+  val close : t -> unit Lwt.t 
 end

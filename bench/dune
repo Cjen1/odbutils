@@ -1,3 +1,3 @@
 (executables
- (names bench_wal)
- (libraries core owl odbutils))
+ (names bench_wal )
+ (libraries bos lwt lwt.unix core owl odbutils))

@@ -5,7 +5,10 @@ let src = Logs.Src.create "Bench"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-let remove path = if Sys.file_exists path then Unix.unlink path else ()
+let remove path = if Sys.file_exists path then 
+    let path = Fpath.of_string path |> Result.get_ok in
+    Bos.OS.Dir.delete ~must_exist:false ~recurse:true path|> Result.get_ok else ()
+
 
 module T_p = struct
   type t = int list
@@ -38,22 +41,20 @@ type test_res = {throughput: float; latencies: float array}
 
 let throughput n =
   Log.info (fun m -> m "Setting up throughput test") ;
-  T.of_file test_file
-  >>= fun t ->
+  T.of_dir test_file
+  >>= fun (t, _t_wal) ->
   let stream = List.init n (fun _ -> Random.int 100) |> Lwt_stream.of_list in
   let result_q = Queue.create () in
   let test () =
-    Lwt_stream.fold_s
-      (fun v t ->
-        Lwt.pause ()
-        >>= fun () ->
+    Lwt_stream.iter_s
+      (fun v ->
         let start = Unix.gettimeofday () in
-        let t = T.change (T_p.Write v) t in
-        T.sync t |> Lwt_result.get_exn
-        >>= fun () ->
+        T.write t (T_p.Write v) |> Lwt.ignore_result;
+        T.datasync t >>= fun () ->
         let lat = Unix.gettimeofday () -. start in
-        Queue.add lat result_q ; Lwt.return t)
-      stream t
+        Queue.add lat result_q ; 
+        Lwt.return ())
+      stream
     >>= fun _ -> Lwt.return_unit
   in
   Log.info (fun m -> m "Starting throughput test") ;
@@ -97,9 +98,9 @@ let pp_stats =
   record fields
 
 let () =
-  Logs.(set_level (Some Debug)) ;
+  Logs.(set_level (Some Info)) ;
   Logs.set_reporter reporter ;
   let res =
-    try Lwt_main.run (throughput 10) with e -> remove test_file ; raise e
+    try Lwt_main.run (throughput 10000) with e -> remove test_file ; raise e
   in
   Fmt.pr "%a" pp_stats res
