@@ -5,10 +5,11 @@ let src = Logs.Src.create "Bench"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-let remove path = if Sys.file_exists path then 
+let remove path =
+  if Sys.file_exists path then
     let path = Fpath.of_string path |> Result.get_ok in
-    Bos.OS.Dir.delete ~must_exist:false ~recurse:true path|> Result.get_ok else ()
-
+    Bos.OS.Dir.delete ~must_exist:false ~recurse:true path |> Result.get_ok
+  else ()
 
 module T_p = struct
   type t = int list
@@ -40,7 +41,7 @@ let test_file = "test.tmp"
 type test_res = {throughput: float; latencies: float array}
 
 let throughput n =
-  (Fmt.pr "Setting up throughput test\n") ;
+  Fmt.pr "Setting up throughput test\n" ;
   T.of_dir test_file
   >>= fun (t, _t_wal) ->
   let stream = List.init n (fun _ -> Random.int 100) |> Lwt_stream.of_list in
@@ -49,18 +50,18 @@ let throughput n =
     Lwt_stream.iter_s
       (fun v ->
         let start = Unix.gettimeofday () in
-        T.write t (T_p.Write v) |> Lwt.ignore_result;
-        T.datasync t >>= fun () ->
+        T.write t (T_p.Write v) |> Lwt.ignore_result ;
+        T.datasync t
+        >>= fun () ->
         let lat = Unix.gettimeofday () -. start in
-        Queue.add lat result_q ; 
-        Lwt.return ())
+        Queue.add lat result_q ; Lwt.return ())
       stream
     >>= fun _ -> Lwt.return_unit
   in
-  (Fmt.pr "Starting throughput test\n") ;
+  Fmt.pr "Starting throughput test\n" ;
   time_it test
   >>= fun time ->
-  (Fmt.pr "Finished throughput test!\n") ;
+  Fmt.pr "Finished throughput test!\n" ;
   let throughput = Float.(of_int n /. time) in
   remove test_file ;
   Lwt.return
