@@ -5,10 +5,15 @@ let src = Logs.Src.create "Bench"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
+let get_ok = function
+  | Ok v -> v
+  | Error (`Msg s) -> invalid_arg s
+
 let remove path =
+  Fmt.pr "Removing %s\n" path;
   if Sys.file_exists path then
-    let path = Fpath.of_string path |> Result.get_ok in
-    Bos.OS.Dir.delete ~must_exist:false ~recurse:true path |> Result.get_ok
+    let path = Fpath.of_string path |> get_ok in
+    Bos.OS.Dir.delete ~must_exist:false ~recurse:true path |> get_ok 
   else ()
 
 module T_p = struct
@@ -63,7 +68,6 @@ let throughput n =
   >>= fun time ->
   Fmt.pr "Finished throughput test!\n" ;
   let throughput = Float.(of_int n /. time) in
-  remove test_file ;
   Lwt.return
     { throughput
     ; latencies= Queue.fold (fun ls e -> e :: ls) [] result_q |> Array.of_list
@@ -83,7 +87,6 @@ let pp_stats =
   record fields
 
 let () =
-  let res =
-    try Lwt_main.run (throughput 10000) with e -> remove test_file ; raise e
-  in
-  Fmt.pr "%a\n" pp_stats res
+  let res = Lwt_main.run (throughput 10000) in
+  Fmt.pr "%a\n" pp_stats res;
+  remove test_file 
