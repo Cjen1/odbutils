@@ -24,3 +24,11 @@ module Persistant (P : Persistable) : sig
 
   val close : t -> unit Lwt.t
 end
+
+module OpsList : sig
+  type 'a t
+  val append : 'a t -> 'a -> 'a t
+  val appendv : 'a t -> 'a list -> 'a t
+  val get_list : 'a t -> 'a list
+  val empty : 'a t
+end 

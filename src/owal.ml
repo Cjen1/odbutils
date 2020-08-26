@@ -2,6 +2,8 @@ open Lwt.Infix
 
 let src = Logs.Src.create "Owal"
 
+module Batch = Batcher.Count
+
 module Log = (val Logs.src_log src : Logs.LOG)
 
 module type Persistable = sig
@@ -49,18 +51,6 @@ module File = struct
       ; serial= S.create ()
       ; sync_cursor= cursor
       ; state= `Open }
-
-  (*
-  let create_partial path size =
-    LU.openfile path [O_WRONLY; O_CREAT] 0o666 >>= fun fd ->
-    LU.lseek fd 0 LU.SEEK_END >>= function
-    | cursor when cursor > size ->
-      Lwt.fail_invalid_arg (Fmt.str "create_partial: cursor (%d) > size (%d)" cursor size)  
-    | cursor ->
-      LU.ftruncate fd size >>= fun () ->
-      LU.fsync fd >>= fun () ->
-      Lwt.return {fd; path; cursor; length = size; serial = S.create (); sync_cursor=cursor; state=`Open}
-     *)
 
   exception Closed
 
@@ -155,25 +145,27 @@ module Persistant (P : Persistable) = struct
     ; default_file_size: int
     ; next_name_stream: string Lwt_stream.t
     ; serial: unit Serialiser.t
-    ; batcher: write Batcher.t }
+    ; batcher: write Batch.t }
+
+  let get_size (p_len, _) = p_len + 4
+
+  let get_total_size bs = List.fold_left (fun acc b -> acc + get_size b) 0 bs
 
   let collate_batch bs =
-    let total_size =
-      List.fold_left (fun acc (p_len, _) -> acc + p_len + 4) 0 bs
-    in
-    Log.debug (fun m -> m "Total_size = %d" total_size) ;
+    let total_size = get_total_size bs in
+    Log.debug (fun m -> m "Total size = %d" total_size);
     let buf = Bytes.create total_size in
     let blitted =
       List.fold_left
         (fun offset (p_len, p_blit) ->
-          Log.debug (fun m ->
-              m "offset = %d, p_len = %d, available = %d" offset p_len
-                (total_size - offset)) ;
           LE.set_int32 buf offset (Int32.of_int p_len) ;
+          Log.debug (fun m -> m "Writing client packet of len %d" p_len);
           p_blit buf ~offset:(offset + 4) ;
+          Log.debug (fun m -> m "Written client packet");
           offset + p_len + 4)
         0 bs
     in
+    Log.debug (fun m -> m "Finished collating batch");
     assert (blitted = total_size) ;
     buf
 
@@ -191,7 +183,8 @@ module Persistant (P : Persistable) = struct
     t.syncable_promise <- Lwt.join [close_p; t.syncable_promise] ;
     Lwt.return_unit
 
-  let rec write_batch t = function
+  let rec write_batch t = 
+    function
     | [] ->
         Log.debug (fun m -> m "Empty batch") ;
         Lwt.return_unit
@@ -203,26 +196,32 @@ module Persistant (P : Persistable) = struct
         |> Lwt.ignore_result ;
         move_to_next_file t >>= fun () -> write_batch t bs
     | bs -> (
+        Log.debug (fun m -> m "Writing batch");
         let current_file_writes, next_file_writes =
           let (_ : int), current_file, next_file =
             List.fold_left
-              (fun (bytes_left, cf, nf) ((p_len, _) as b) ->
-                if p_len < bytes_left then (bytes_left - p_len, b :: cf, nf)
+              (fun (bytes_left, cf, nf) b ->
+                let usage = get_size b in
+                if usage < bytes_left then (bytes_left - usage, b :: cf, nf)
                 else (0, cf, b :: nf))
               (F.available t.current_file, [], [])
               bs
           in
           (List.rev current_file, List.rev next_file)
         in
+        Log.debug (fun m -> m "Split buffers into files");
         let current_write =
           match current_file_writes with
           | [] ->
               Log.debug (fun m -> m "Nothing to write to current file") ;
               Lwt.return_unit
           | bs ->
+              Log.debug (fun m -> m "Writting current buffer") ;
               let buf = collate_batch bs in
+              Log.debug (fun m -> m "Collated batch") ;
               F.schedule_write t.current_file buf 0 (Bytes.length buf)
         in
+        Log.debug (fun m -> m "Scheduled current write") ;
         match next_file_writes with
         | [] ->
             (* Able to write entirety to single file *)
@@ -236,10 +235,10 @@ module Persistant (P : Persistable) = struct
 
   let write t v =
     let p_len, p_blit = P.encode_blit v in
-    Batcher.auto_dispatch t.batcher (p_len, p_blit) (write_batch_serial t)
+    Batch.auto_dispatch t.batcher (write_batch_serial t) (p_len, p_blit)
 
   let datasync t =
-    Batcher.perform t.batcher (write_batch_serial t) |> Lwt.ignore_result ;
+    Batch.perform t.batcher (write_batch_serial t) |> Lwt.ignore_result ;
     Serialiser.serialise t.serial (fun () ->
         Lwt.join [F.datasync t.current_file; t.syncable_promise])
 
@@ -262,7 +261,7 @@ module Persistant (P : Persistable) = struct
       Lwt_io.read_into_exactly channel payload_buf 0 size
       >>= fun () -> payload_buf |> Lwt.return_some )
 
-  let of_dir ?(default_file_size = 1024 * 1024) ?(batch_size = 512) path =
+  let of_dir ?(default_file_size = 1024 * 1024) ?(batch_size = 10) path =
     let _create_dir_if_needed : unit =
       if Sys.file_exists path then () else Unix.mkdir path 0o777
     in
@@ -310,7 +309,7 @@ module Persistant (P : Persistable) = struct
       ; default_file_size
       ; next_name_stream
       ; serial= Serialiser.create ()
-      ; batcher= Batcher.create batch_size }
+      ; batcher= Batch.create batch_size }
     , t )
     |> Lwt.return
 
@@ -320,3 +319,11 @@ module Persistant (P : Persistable) = struct
     F.close t.current_file
     >>= fun () -> t.next_file >>= fun next_file -> F.close next_file
 end
+
+module OpsList = struct
+  type 'a t = 'a list
+  let append t x = x :: t
+  let appendv t xs = xs @ t
+  let get_list t = List.rev t
+  let empty = []
+end 
