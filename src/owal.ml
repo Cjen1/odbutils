@@ -63,11 +63,9 @@ module File = struct
     Lwt_unix.write t.fd buf offset size
     >>= fun written ->
     if written = 0 then (
-      (*
+      Log.err (fun m -> m "%s: File unexpectedly closed" t.path) ;
       Lwt.fail Closed
-         *)
-      Log.err (fun m -> m "%s: closed file" t.path) ;
-      Lwt.return_unit )
+      )
     else if written = size then Lwt.return_unit
     else loop t buf (offset + written) (size - written)
 
