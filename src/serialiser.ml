@@ -1,18 +1,26 @@
-open Lwt.Infix
+type 'a t = {push: (unit -> unit Lwt.t) -> unit Lwt.t}
 
-type 'a t = {mutable promise: 'a Lwt.t; mutable length: int}
+let serialise ser f = ser.push f
 
-let serialise ser f =
-  ser.length <- ser.length + 1 ;
-  let p =
-    ser.promise
-    >>= fun v ->
-    f v
-    >>= fun v ->
-    ser.length <- ser.length - 1 ;
-    Lwt.return v
+let create () =
+  let stream, push = Lwt_stream.create () in
+  let push e =
+    let v, f = Lwt.task () in
+    push (Some (f, e)) ;
+    v
   in
-  ser.promise <- p ;
-  p
-
-let create () = {promise= Lwt.return_unit; length= 0}
+  let fold (ful, f) () =
+    let p = Lwt.apply f () in
+    Lwt.on_any p
+      (* Success *)
+        (fun () -> Lwt.wakeup ful ())
+      (* Failure *)
+        (fun exn -> Lwt.wakeup_exn ful exn) ;
+    p
+  in
+  let serialiser_thread = Lwt_stream.fold_s fold stream () in
+  Lwt.on_failure serialiser_thread (fun exn ->
+      Logs.debug (fun m ->
+          m "Encountered error while serialising: %a" Fmt.exn_backtrace
+            (exn, Printexc.get_raw_backtrace ()))) ;
+  {push}
