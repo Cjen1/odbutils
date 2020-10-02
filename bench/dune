@@ -1,3 +1,4 @@
 (tests
  (names bench_wal)
- (libraries odbutils bos owl))
+ (libraries odbutils fileutils owl yojson)
+ (preprocess (pps ppx_deriving_yojson)) )
