@@ -1,13 +1,16 @@
-(*
-
-open Lwt.Infix
-open Odbutils.Owal
+open! Core
+open! Async
 
 let src = Logs.Src.create "Bench"
 
 module Log = (val Logs.src_log src : Logs.LOG)
 
-type test_res = {throughput: float; latencies: float array} [@@deriving yojson]
+type test_res =
+  { throughput: float
+  ; starts: float array
+  ; ends: float array
+  ; latencies: float array }
+[@@deriving yojson]
 
 (* test_res Fmt.t*)
 let pp_stats =
@@ -27,63 +30,43 @@ module T_p = struct
 
   let init () = []
 
-  type op = Write of bytes
-
-  let encode_blit =
-    let handler b len buf ~offset =
-      EndianBytes.BigEndian_unsafe.set_int64 buf offset (Int64.of_int len) ;
-      BytesLabels.blit ~src:b ~src_pos:0 ~dst:buf ~dst_pos:offset ~len
-    in
-    function
-    | Write b ->
-        let len = Bytes.length b in
-        (len + 8, handler b len)
-
-  let decode buf ~offset =
-    let len =
-      EndianBytes.BigEndian_unsafe.get_int64 buf offset |> Int64.to_int
-    in
-    let b = BytesLabels.sub buf ~pos:offset ~len in
-    Write b
+  type op = Write of bytes [@@deriving bin_io]
 
   let apply t (Write b) = b :: t
 end
 
-module T = Persistant (T_p)
-
-let time_it f =
-  let start = Unix.gettimeofday () in
-  f () >>= fun () -> Unix.gettimeofday () -. start |> Lwt.return
+module T = Odbutils.Owal.Persistant (T_p)
 
 let throughput file n write_size =
-  Log.info (fun m -> m "Setting up throughput test\n" );
-  T.of_dir file
-  >>= fun (t, _t_wal) ->
+  Log.info (fun m -> m "Setting up throughput test\n") ;
+  let%bind wal, _t = T.of_path file in
   let stream =
-    List.init n (fun _ -> Bytes.init write_size (fun _ -> 'c'))
-    |> Lwt_stream.of_list
+    List.init n ~f:(fun _ -> Bytes.init write_size ~f:(fun _ -> 'c'))
+    |> Async.Stream.of_list
   in
   let result_q = Queue.create () in
-  let test () =
-    Lwt_stream.iter_s
-      (fun v ->
-        let start = Unix.gettimeofday () in
-        T.write t (T_p.Write v) |> Lwt.ignore_result ;
-        T.datasync t
-        >>= fun () ->
-        let lat = Unix.gettimeofday () -. start in
-        Queue.add lat result_q ; Lwt.return ())
+  Log.info (fun m -> m "Starting throughput test\n") ;
+  let%bind () =
+    Stream.iter'
+      ~f:(fun v ->
+        let start =
+          Time.now () |> Time.to_span_since_epoch |> Time.Span.to_sec
+        in
+        T.write wal (T_p.Write v) ;
+        let%bind () = T.datasync wal in
+        let ed = Time.now () |> Time.to_span_since_epoch |> Time.Span.to_sec in
+        Queue.enqueue result_q (start, ed) ;
+        return ())
       stream
-    >>= fun _ -> Lwt.return_unit
   in
-  Log.info (fun m -> m "Starting throughput test\n" );
-  time_it test
-  >>= fun time ->
-  Log.info (fun m -> m "Finished throughput test!\n" );
-  let throughput = Float.(of_int n /. time) in
-  { throughput
-  ; latencies= Queue.fold (fun ls e -> e :: ls) [] result_q |> Array.of_list }
-  |> Lwt.return
+  Log.info (fun m -> m "Finished throughput test!\n") ;
+  let results = Queue.to_array result_q in
+  let min_start = Array.map ~f:fst results |> Owl_stats.min in
+  let max_end = Array.map ~f:snd results |> Owl_stats.max in
+  let throughput = Float.(of_int n / (max_end - min_start)) in
+  let starts, ends = Array.unzip results in
+  let latencies = Array.map ~f:(fun (st, ed) -> ed -. st) results in
+  {throughput; starts; ends; latencies} |> return
 
 let reporter =
   let report src level ~over k msgf =
@@ -99,23 +82,34 @@ let reporter =
   in
   {Logs.report}
 
-let () =
-  let n = 10000 in
+let main n write_sizes log output =
   let perform () =
-    let write_sizes = [0; 4; 16; 64; 256; 1024; 4096; 8192; 32768] in
     let iter write_size =
-      let tag = Fmt.str "test_%d.tmp" write_size in
-      throughput tag n write_size
-      >>= fun res ->
-      Log.info (fun m -> m "%a\n" pp_stats res );
+      let log = 
+        let prefix = match log with | None -> "" | Some v -> v ^ "/" in
+        Fmt.str "%s%d.wal" prefix write_size
+      in 
+      let jsonpath = match output with None -> Fmt.str "%d.json" write_size | Some s -> s in
+      let%bind res = throughput log n write_size in
+      Log.info (fun m -> m "%a\n" pp_stats res) ;
       let json = test_res_to_yojson res in
-      let fpath = Fmt.str "%d.json" write_size in
-      Yojson.Safe.to_file fpath json ;
-      Lwt.return_unit
+      Yojson.Safe.to_file jsonpath json ;
+      return ()
     in
-    Lwt_list.iter_s iter write_sizes
+    Deferred.List.iter ~f:iter write_sizes
   in
   Logs.(set_level (Some Info)) ;
-  Logs.set_reporter reporter ; 
-  Lwt_main.run (perform ())
-   *)
+  Logs.set_reporter reporter ; perform ()
+
+let () =
+  Command.async_spec ~summary:"Benchmark for write ahead log"
+    Command.Spec.(
+      empty
+      +> flag "-s" ~doc:" Size of buffers" (listed int)
+      +> flag "-n" ~doc:" Number of requests to send"
+           (optional_with_default 10000 int)
+      +> flag "-l" ~doc:" Log location prefix"
+           (optional string)
+      +> flag "-o" ~doc:" Output file" (optional string))
+    (fun write_sizes n l o () -> main n write_sizes l o)
+  |> Command.run
