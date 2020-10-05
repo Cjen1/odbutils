@@ -85,11 +85,13 @@ let reporter =
 let main n write_sizes log output =
   let perform () =
     let iter write_size =
-      let log = 
-        let prefix = match log with | None -> "" | Some v -> v ^ "/" in
+      let log =
+        let prefix = match log with None -> "" | Some v -> v ^ "/" in
         Fmt.str "%s%d.wal" prefix write_size
-      in 
-      let jsonpath = match output with None -> Fmt.str "%d.json" write_size | Some s -> s in
+      in
+      let jsonpath =
+        match output with None -> Fmt.str "%d.json" write_size | Some s -> s
+      in
       let%bind res = throughput log n write_size in
       Log.info (fun m -> m "%a\n" pp_stats res) ;
       let json = test_res_to_yojson res in
@@ -108,8 +110,7 @@ let () =
       +> flag "-s" ~doc:" Size of buffers" (listed int)
       +> flag "-n" ~doc:" Number of requests to send"
            (optional_with_default 10000 int)
-      +> flag "-l" ~doc:" Log location prefix"
-           (optional string)
+      +> flag "-l" ~doc:" Log location prefix" (optional string)
       +> flag "-o" ~doc:" Output file" (optional string))
     (fun write_sizes n l o () -> main n write_sizes l o)
   |> Command.run

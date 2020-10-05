@@ -3,5 +3,5 @@
  (public_name odbutils)
  (inline_tests)
  (libraries core async logs logs.fmt fmt.tty)
- (preprocess (pps ppx_jane))
- )
+ (preprocess
+  (pps ppx_jane)))
