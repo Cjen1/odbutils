@@ -1,4 +1,4 @@
-(tests
+(executables
  (names bench_wal failing)
  (libraries odbutils core async fileutils owl yojson)
  (preprocess
