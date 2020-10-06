@@ -15,14 +15,6 @@ end
 
 module T = Persistant (T_p)
 
-let unlink path =
-  let open Async in
-  match%bind Sys.file_exists path with
-  | `Yes ->
-      Unix.unlink path
-  | _ ->
-      return ()
-
 let with_timeout f =
   let p = f () in
   let timeout = Time.Span.of_sec 1. in
@@ -37,7 +29,6 @@ let%expect_test "persist data" =
   @@ fun () ->
   let open T in
   let path = "test.wal" in
-  let%bind () = unlink path in
   let%bind wal, t = of_path path Int64.(of_int 16) in
   [%sexp_of: int list] t |> Sexp.to_string_hum |> print_endline ;
   let%bind () = [%expect {| () |}] in

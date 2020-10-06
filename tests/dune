@@ -1,5 +1,5 @@
 (library
- (name tests)
+ (name test)
  (inline_tests)
  (libraries odbutils core async logs logs.fmt fmt.tty)
  (preprocess
