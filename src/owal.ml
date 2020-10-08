@@ -180,7 +180,7 @@ module Persistant (P : Persistable) = struct
             U.accumulate t.file_closure_chain curr |> don't_wait_for ;
             U.accumulate t.file_closure_chain next)
 
-  let of_path path default_file_size =
+  let of_path ?(file_size = Int64.(of_int 2 ** of_int 20 * of_int 128 )) path =
     let%bind _create_dir_if_needed =
       match%bind Sys.file_exists path with
       | `Yes ->
@@ -210,15 +210,15 @@ module Persistant (P : Persistable) = struct
     in
     let%bind v, path = read_file_loop (P.init ()) in
     let%bind current_file =
-      File.create path ~len:default_file_size ~append:false
+      File.create path ~len:file_size ~append:false
     in
     let next_file =
-      File.create (name_gen ()) ~len:default_file_size ~append:false
+      File.create (name_gen ()) ~len:file_size ~append:false
     in
     return
       ( { name_gen
         ; state= `Open
-        ; default_file_size
+        ; default_file_size=file_size
         ; current_file
         ; next_file
         ; serialisation_chain= U.make_chain ()
