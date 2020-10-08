@@ -1,4 +1,5 @@
-open Lwt.Infix
+open! Core
+open! Async
 
 let src = Logs.Src.create "Owal"
 
@@ -9,314 +10,220 @@ module type Persistable = sig
 
   val init : unit -> t
 
-  type op
-
-  val encode_blit : op -> int * (bytes -> offset:int -> unit)
-
-  val decode : bytes -> offset:int -> op
+  type op [@@deriving bin_io]
 
   val apply : t -> op -> t
 end
 
-module S = Serialiser
-module LU = Lwt_unix
-module LE = EndianBytes.LittleEndian
-
 module File = struct
   type t =
-    { fd: LU.file_descr
-    ; path: string
-    ; mutable length: int
-    ; mutable cursor: int
-    ; mutable serial: unit Serialiser.t
-    ; mutable sync_cursor: int
+    { path: string
+    ; writer: Async.Writer.t
+    ; mutable cursor: int64
+    ; mutable length: int64
     ; mutable state: [`Open | `Closed] }
 
-  let create_empty path size =
-    LU.openfile path [O_WRONLY; O_CREAT; O_TRUNC] 0o666
-    >>= fun fd ->
-    let cursor = 0 in
-    Log.debug (fun m -> m "%s: Creating file of size %d" path size) ;
-    LU.ftruncate fd size
-    >>= fun () ->
-    LU.fsync fd
-    >>= fun () ->
-    Lwt.return
-      { fd
-      ; path
-      ; cursor
-      ; length= size
-      ; serial= S.create ()
-      ; sync_cursor= cursor
-      ; state= `Open }
+  let create path ~len ~append =
+    let%bind writer = Writer.open_file ~append path in
+    let%bind () = Unix.ftruncate (Writer.fd writer) ~len in
+    let%bind () = Writer.fsync writer in
+    return {path; writer; cursor= Int64.zero; length= len; state= `Open}
 
-  (*
-  let create_partial path size =
-    LU.openfile path [O_WRONLY; O_CREAT] 0o666 >>= fun fd ->
-    LU.lseek fd 0 LU.SEEK_END >>= function
-    | cursor when cursor > size ->
-      Lwt.fail_invalid_arg (Fmt.str "create_partial: cursor (%d) > size (%d)" cursor size)  
-    | cursor ->
-      LU.ftruncate fd size >>= fun () ->
-      LU.fsync fd >>= fun () ->
-      Lwt.return {fd; path; cursor; length = size; serial = S.create (); sync_cursor=cursor; state=`Open}
-     *)
+  let close t =
+    match t.state with
+    | `Closed ->
+        (*print_endline @@ Fmt.str "%s: file.state closed" t.path ;*)
+        Writer.close_finished t.writer
+    | `Open -> (
+        (*print_endline @@ Fmt.str "%s: file.state open" t.path ;*)
+        t.state <- `Closed ;
+        match Int64.(t.cursor = zero) with
+        | true ->
+            (*print_endline @@ Fmt.str "%s: empty file" t.path ;*)
+            let%bind () = Writer.close t.writer in
+            Unix.unlink t.path
+        | false ->
+            (*print_endline @@ Fmt.str "%s: truncating" t.path ;*)
+            let%bind () = Unix.ftruncate (Writer.fd t.writer) ~len:t.cursor in
+            Writer.close t.writer )
+
+  let datasync t =
+    match t.state with
+    | `Closed ->
+        Writer.close_finished t.writer
+    | `Open ->
+        Writer.fdatasync t.writer
+
+  let write_raw t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
+    let len =
+      bin_prot.size v + Bin_prot.Utils.size_header_length |> Int64.of_int
+    in
+    t.cursor <- Int64.(t.cursor + len) ;
+    Writer.write_bin_prot t.writer bin_prot v
+
+  let write_bin_prot t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
+    (*print_endline @@ Fmt.str "Writing to %s" t.path;*)
+    let len =
+      bin_prot.size v + Bin_prot.Utils.size_header_length |> Int64.of_int
+    in
+    match t.state with
+    | `Closed ->
+        Error `Closed
+    | `Open when Int64.(t.cursor + len > t.length) ->
+        Error `OOM
+    | `Open ->
+        write_raw t bin_prot v ; Ok ()
+
+  let write_bin_prot_oversized t b v = write_raw t b v
+end
+
+module U : sig
+  type chain
+
+  val make_chain : unit -> chain
+
+  type accumulator
+
+  val make_accumulator : unit -> accumulator
+
+  val linearise : chain -> (unit -> unit Deferred.t) -> unit Deferred.t
+
+  val get_tl : chain -> unit Deferred.t
+
+  val accumulate : accumulator -> unit Deferred.t -> unit Deferred.t
+
+  val get_acc : accumulator -> unit Deferred.t
+end = struct
+  type chain = unit Deferred.t ref
+
+  type accumulator = unit Deferred.t ref
+
+  let make_accumulator () = ref @@ return ()
+
+  let make_chain = make_accumulator
+
+  let linearise t f =
+    let p = !t >>= f in
+    t := p ;
+    p
+
+  let get_tl t = !t
+
+  let accumulate t v =
+    let p = Deferred.all_unit [!t; v] in
+    t := p ;
+    p
+
+  let get_acc t = !t
+end
+
+module Persistant (P : Persistable) = struct
+  type t =
+    { default_file_size: int64
+    ; mutable state: [`Open | `Closed]
+    ; mutable current_file: File.t
+    ; mutable next_file: File.t Deferred.t
+    ; name_gen: unit -> string
+    ; serialisation_chain: U.chain
+    ; file_closure_chain: U.accumulator }
+
+  let move_to_next_file t =
+    U.accumulate t.file_closure_chain (File.close t.current_file)
+    |> don't_wait_for ;
+    let%bind next_file = t.next_file in
+    t.current_file <- next_file ;
+    let next_name = t.name_gen () in
+    t.next_file <- File.create next_name ~append:false ~len:t.default_file_size ;
+    return ()
 
   exception Closed
 
-  exception OOM
-
-  let available f = f.length - f.cursor
-
-  let rec loop t buf offset size =
-    Log.debug (fun m -> m "%s: Writing buf" t.path) ;
-    Lwt_unix.write t.fd buf offset size
-    >>= fun written ->
-    if written = 0 then (
-      (*
-      Lwt.fail Closed
-         *)
-      Log.err (fun m -> m "%s: closed file" t.path) ;
-      Lwt.return_unit )
-    else if written = size then Lwt.return_unit
-    else loop t buf (offset + written) (size - written)
-
-  let schedule_write file buf off len =
-    Log.debug (fun m -> m "%s scheduling write" file.path) ;
-    match file with
-    | {state= `Closed; _} ->
-        Lwt.fail Closed
-    | _ when file.cursor + len > file.length ->
-        Lwt.fail OOM
-    | _ ->
-        file.cursor <- file.cursor + len ;
-        let f () = loop file buf off len in
-        Serialiser.serialise file.serial f
-
-  let datasync file =
-    let f () =
-      if file.sync_cursor = file.cursor then (
-        Log.debug (fun m -> m "%s File: Nothing to sync" file.path) ;
-        Lwt.return_unit )
-      else (
-        Log.debug (fun m -> m "%s File: datasyncing" file.path) ;
-        LU.fdatasync file.fd
-        >>= fun () ->
-        file.sync_cursor <- file.cursor ;
-        Lwt.return_unit )
-    in
-    Serialiser.serialise file.serial f
-
-  let close file =
-    Log.debug (fun m -> m "%s Closing file" file.path) ;
-    match file.state with
-    | `Closed ->
-        Serialiser.serialise file.serial (fun () -> Lwt.return_unit)
-    | `Open ->
-        file.state <- `Closed ;
-        Serialiser.serialise file.serial (fun () ->
-            if file.cursor = 0 then (
-              Log.debug (fun m -> m "%s Closing empty file" file.path) ;
-              LU.close file.fd >>= fun () -> LU.unlink file.path )
-            else (
-              Log.debug (fun m ->
-                  m "%s Closing file of size %d" file.path file.cursor) ;
-              LU.ftruncate file.fd file.cursor >>= fun () -> LU.close file.fd ))
-
-  let resize file size =
-    match file with
-    | {cursor; _} when cursor > size ->
-        Lwt.fail_invalid_arg "Cursor greater than size"
-    | _ ->
-        LU.ftruncate file.fd size
-        >>= fun () ->
-        LU.fsync file.fd
-        >>= fun () ->
-        file.length <- size ;
-        Lwt.return_unit
-
-  let write_oversized t buf off len =
-    Log.debug (fun m -> m "%s: write_oversized" t.path) ;
-    let new_size = t.cursor + len in
-    Serialiser.serialise t.serial (fun () -> resize t new_size)
-    |> Lwt.ignore_result ;
-    schedule_write t buf off len
-end
-
-module F = File
-
-module Persistant (P : Persistable) = struct
-  type write = int * (bytes -> offset:int -> unit)
-
-  type t =
-    { mutable current_file: File.t
-    ; mutable next_file: File.t Lwt.t
-    ; mutable syncable_promise: unit Lwt.t
-    ; default_file_size: int
-    ; next_name_stream: string Lwt_stream.t
-    ; serial: unit Serialiser.t
-    ; batcher: write Batcher.t }
-
-  let collate_batch bs =
-    let total_size =
-      List.fold_left (fun acc (p_len, _) -> acc + p_len + 4) 0 bs
-    in
-    Log.debug (fun m -> m "Total_size = %d" total_size) ;
-    let buf = Bytes.create total_size in
-    let blitted =
-      List.fold_left
-        (fun offset (p_len, p_blit) ->
-          Log.debug (fun m ->
-              m "offset = %d, p_len = %d, available = %d" offset p_len
-                (total_size - offset)) ;
-          LE.set_int32 buf offset (Int32.of_int p_len) ;
-          p_blit buf ~offset:(offset + 4) ;
-          offset + p_len + 4)
-        0 bs
-    in
-    assert (blitted = total_size) ;
-    buf
-
-  let move_to_next_file t =
-    Log.debug (fun m -> m "Moving to next file") ;
-    let close_p = F.close t.current_file in
-    t.next_file
-    >>= fun next_file ->
-    t.current_file <- next_file ;
-    Lwt_stream.get t.next_name_stream
-    >|= Option.get
-    >>= fun next_name ->
-    let next_file_p = F.create_empty next_name t.default_file_size in
-    t.next_file <- next_file_p ;
-    t.syncable_promise <- Lwt.join [close_p; t.syncable_promise] ;
-    Lwt.return_unit
-
-  let rec write_batch t = function
-    | [] ->
-        Log.debug (fun m -> m "Empty batch") ;
-        Lwt.return_unit
-    | ((p_len, _) as b) :: _ as bs
-      when p_len > F.available t.current_file && p_len > t.default_file_size ->
-        Log.debug (fun m -> m "Too large of a file to be written") ;
-        let buf = collate_batch [b] in
-        F.write_oversized t.current_file buf 0 (Bytes.length buf)
-        |> Lwt.ignore_result ;
-        move_to_next_file t >>= fun () -> write_batch t bs
-    | bs -> (
-        let current_file_writes, next_file_writes =
-          let (_ : int), current_file, next_file =
-            List.fold_left
-              (fun (bytes_left, cf, nf) ((p_len, _) as b) ->
-                if p_len < bytes_left then (bytes_left - p_len, b :: cf, nf)
-                else (0, cf, b :: nf))
-              (F.available t.current_file, [], [])
-              bs
-          in
-          (List.rev current_file, List.rev next_file)
-        in
-        let current_write =
-          match current_file_writes with
-          | [] ->
-              Log.debug (fun m -> m "Nothing to write to current file") ;
-              Lwt.return_unit
-          | bs ->
-              let buf = collate_batch bs in
-              F.schedule_write t.current_file buf 0 (Bytes.length buf)
-        in
-        match next_file_writes with
-        | [] ->
-            (* Able to write entirety to single file *)
-            current_write
-        | bs ->
-            Log.debug (fun m -> m "File full, moving to next one") ;
-            move_to_next_file t >>= fun () -> write_batch t bs )
-
-  let write_batch_serial t bs =
-    S.serialise t.serial (fun () -> write_batch t bs)
-
-  let write t v =
-    let p_len, p_blit = P.encode_blit v in
-    Batcher.auto_dispatch t.batcher (p_len, p_blit) (write_batch_serial t)
+  let write_bin_prot t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
+    U.linearise t.serialisation_chain (fun () ->
+        match File.write_bin_prot t.current_file bin_prot v with
+        | Error `OOM ->
+            File.write_bin_prot_oversized t.current_file bin_prot v ;
+            move_to_next_file t
+        | Error `Closed ->
+            raise Closed
+        | Ok () ->
+            return ())
+    |> don't_wait_for
 
   let datasync t =
-    Batcher.perform t.batcher (write_batch_serial t) |> Lwt.ignore_result ;
-    Serialiser.serialise t.serial (fun () ->
-        Lwt.join [F.datasync t.current_file; t.syncable_promise])
-
-  let make_name_generator path =
-    let count_r = ref 0 in
-    fun () ->
-      let count = !count_r in
-      incr count_r ;
-      Fmt.str "%s/%d.wal" path count
-
-  let read_value channel =
-    let rd_buf = Bytes.create 4 in
-    Lwt_io.read_into_exactly channel rd_buf 0 4
-    >>= fun () ->
-    let size = LE.get_int32 rd_buf 0 |> Int32.to_int in
-    if size <= 0 then Lwt.return_none
-    else (
-      Log.debug (fun m -> m "Reading payload of %d bytes" size) ;
-      let payload_buf = Bytes.create size in
-      Lwt_io.read_into_exactly channel payload_buf 0 size
-      >>= fun () -> payload_buf |> Lwt.return_some )
-
-  let of_dir ?(default_file_size = 1024 * 1024) ?(batch_size = 512) path =
-    let _create_dir_if_needed : unit =
-      if Sys.file_exists path then () else Unix.mkdir path 0o777
-    in
-    let next_name_stream =
-      let name_generator = make_name_generator path in
-      Lwt_stream.from_direct (fun () -> Some (name_generator ()))
-    in
-    let stream_generator path =
-      Lwt_unix.openfile path Lwt_unix.[O_RDONLY; O_CREAT] 0o640
-      >>= fun fd ->
-      let input_channel = Lwt_io.of_fd ~mode:Lwt_io.input fd in
-      let stream =
-        Lwt_stream.from (fun () ->
-            Lwt.catch
-              (fun () -> read_value input_channel)
-              (function _ -> Lwt.return_none))
-      in
-      Lwt_stream.closed stream
-      >>= (fun () -> Lwt_io.close input_channel)
-      |> Lwt.ignore_result ;
-      Lwt.return stream
-    in
-    Lwt_stream.get_while Sys.file_exists next_name_stream
-    >>= fun existing_names ->
-    let name_stream = Lwt_stream.of_list existing_names in
-    let streams = Lwt_stream.map_s stream_generator name_stream in
-    let token_stream =
-      Lwt_stream.concat streams |> Lwt_stream.map (P.decode ~offset:0)
-    in
-    Lwt_stream.fold (fun v t -> P.apply t v) token_stream (P.init ())
-    >>= fun t ->
-    Logs.debug (fun m -> m "Setting up files") ;
-    Lwt_stream.get next_name_stream
-    >|= Option.get
-    >>= fun next_name ->
-    F.create_empty next_name default_file_size
-    >>= fun current_file ->
-    Lwt_stream.get next_name_stream
-    >|= Option.get
-    >>= fun next_name ->
-    let next_file = F.create_empty next_name default_file_size in
-    ( { current_file
-      ; next_file
-      ; syncable_promise= Lwt.return_unit
-      ; default_file_size
-      ; next_name_stream
-      ; serial= Serialiser.create ()
-      ; batcher= Batcher.create batch_size }
-    , t )
-    |> Lwt.return
+    (* Need to ensure that datasync is called before any further writes, so *)
+    let ivar = Ivar.create () in
+    U.linearise t.serialisation_chain (fun () ->
+        (* Ensure previous files are closed before returning *)
+        let p =
+          let%bind () =
+            Deferred.all_unit
+              [U.get_acc t.file_closure_chain; File.datasync t.current_file]
+          in
+          Ivar.fill ivar () |> return
+        in
+        p |> don't_wait_for |> return)
+    |> don't_wait_for ;
+    Ivar.read ivar
 
   let close t =
-    datasync t
-    >>= fun () ->
-    F.close t.current_file
-    >>= fun () -> t.next_file >>= fun next_file -> F.close next_file
+    match t.state with
+    | `Closed ->
+        U.get_tl t.serialisation_chain
+    | `Open ->
+        U.linearise t.serialisation_chain (fun () ->
+            let curr = File.close t.current_file in
+            let next =
+              let%bind file = t.next_file in
+              File.close file
+            in
+            U.accumulate t.file_closure_chain curr |> don't_wait_for ;
+            U.accumulate t.file_closure_chain next)
+
+  let of_path path default_file_size =
+    let%bind _create_dir_if_needed =
+      match%bind Sys.file_exists path with
+      | `Yes ->
+          return ()
+      | _ ->
+          Unix.mkdir path
+    in
+    let name_gen =
+      let counter = ref 0 in
+      fun () ->
+        incr counter ;
+        Fmt.str "%s/%d.wal" path !counter
+    in
+    let rec read_value_loop t reader =
+      match%bind Reader.read_bin_prot reader P.bin_reader_op with
+      | `Eof ->
+          return t
+      | `Ok op ->
+          read_value_loop (P.apply t op) reader
+    in
+    let rec read_file_loop v =
+      let path = name_gen () in
+      let%bind res =
+        try_with (fun () -> Reader.with_file path ~f:(read_value_loop v))
+      in
+      match res with Ok v -> read_file_loop v | Error _ -> return (v, path)
+    in
+    let%bind v, path = read_file_loop (P.init ()) in
+    let%bind current_file =
+      File.create path ~len:default_file_size ~append:false
+    in
+    let next_file =
+      File.create (name_gen ()) ~len:default_file_size ~append:false
+    in
+    return
+      ( { name_gen
+        ; state= `Open
+        ; default_file_size
+        ; current_file
+        ; next_file
+        ; serialisation_chain= U.make_chain ()
+        ; file_closure_chain= U.make_accumulator () }
+      , v )
+
+  let write t op = write_bin_prot t P.bin_writer_op op
 end

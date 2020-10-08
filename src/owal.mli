@@ -1,13 +1,12 @@
+open! Core
+open! Async
+
 module type Persistable = sig
   type t
 
   val init : unit -> t
 
-  type op
-
-  val encode_blit : op -> int * (bytes -> offset:int -> unit)
-
-  val decode : bytes -> offset:int -> op
+  type op [@@deriving bin_io]
 
   val apply : t -> op -> t
 end
@@ -15,12 +14,11 @@ end
 module Persistant (P : Persistable) : sig
   type t
 
-  val of_dir :
-    ?default_file_size:int -> ?batch_size:int -> string -> (t * P.t) Lwt.t
+  val of_path : string -> int64 -> (t * P.t) Deferred.t
 
-  val datasync : t -> unit Lwt.t
+  val write : t -> P.op -> unit
 
-  val write : t -> P.op -> unit Lwt.t
+  val datasync : t -> unit Deferred.t
 
-  val close : t -> unit Lwt.t
+  val close : t -> unit Deferred.t
 end
