@@ -1,5 +1,5 @@
 (executables
- (names bench_wal failing)
+ (names bench_wal)
  (libraries odbutils core async fileutils owl yojson)
  (preprocess
   (pps ppx_deriving_yojson ppx_jane)))

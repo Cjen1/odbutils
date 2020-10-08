@@ -39,16 +39,21 @@ module T = Odbutils.Owal.Persistant (T_p)
 
 let throughput file n write_size =
   Log.info (fun m -> m "Setting up throughput test\n") ;
-  let%bind wal, _t = T.of_path file Int64.(of_int 4096) in
+  let%bind wal, _t = T.of_path file Int64.(of_int Int.(1024*1024*128)) in
   let stream =
     List.init n ~f:(fun _ -> Bytes.init write_size ~f:(fun _ -> 'c'))
     |> Async.Stream.of_list
   in
   let result_q = Queue.create () in
   Log.info (fun m -> m "Starting throughput test\n") ;
+  let i = ref 0 in
   let%bind () =
     Stream.iter'
       ~f:(fun v ->
+        let () =
+          incr i ;
+          if !i % 100 = 0 then print_char '.'
+        in
         let start =
           Time.now () |> Time.to_span_since_epoch |> Time.Span.to_sec
         in

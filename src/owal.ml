@@ -47,7 +47,12 @@ module File = struct
             let%bind () = Unix.ftruncate (Writer.fd t.writer) ~len:t.cursor in
             Writer.close t.writer )
 
-  let datasync t = Writer.fdatasync t.writer
+  let datasync t = 
+    match t.state with
+    | `Closed ->
+      Writer.close_finished t.writer
+    | `Open ->
+      Writer.fdatasync t.writer
 
   let write_bin_prot t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
     (*print_endline @@ Fmt.str "Writing to %s" t.path;*)
