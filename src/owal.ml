@@ -20,14 +20,14 @@ module File = struct
     { path: string
     ; writer: Async.Writer.t
     ; mutable cursor: int64
-    ; mutable length: int64 
-    ; mutable state : [`Open | `Closed] }
+    ; mutable length: int64
+    ; mutable state: [`Open | `Closed] }
 
   let create path ~len ~append =
     let%bind writer = Writer.open_file ~append path in
     let%bind () = Unix.ftruncate (Writer.fd writer) ~len in
     let%bind () = Writer.fsync writer in
-    return {path; writer; cursor= Int64.zero; length= len; state=`Open}
+    return {path; writer; cursor= Int64.zero; length= len; state= `Open}
 
   let close t =
     match t.state with
@@ -36,7 +36,7 @@ module File = struct
         Writer.close_finished t.writer
     | `Open -> (
         (*print_endline @@ Fmt.str "%s: file.state open" t.path ;*)
-        t.state <- `Closed;
+        t.state <- `Closed ;
         match Int64.(t.cursor = zero) with
         | true ->
             (*print_endline @@ Fmt.str "%s: empty file" t.path ;*)
@@ -47,12 +47,19 @@ module File = struct
             let%bind () = Unix.ftruncate (Writer.fd t.writer) ~len:t.cursor in
             Writer.close t.writer )
 
-  let datasync t = 
+  let datasync t =
     match t.state with
     | `Closed ->
-      Writer.close_finished t.writer
+        Writer.close_finished t.writer
     | `Open ->
-      Writer.fdatasync t.writer
+        Writer.fdatasync t.writer
+
+  let write_raw t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
+    let len =
+      bin_prot.size v + Bin_prot.Utils.size_header_length |> Int64.of_int
+    in
+    t.cursor <- Int64.(t.cursor + len) ;
+    Writer.write_bin_prot t.writer bin_prot v
 
   let write_bin_prot t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
     (*print_endline @@ Fmt.str "Writing to %s" t.path;*)
@@ -65,64 +72,113 @@ module File = struct
     | `Open when Int64.(t.cursor + len > t.length) ->
         Error `OOM
     | `Open ->
-        t.cursor <- Int64.(t.cursor + len) ;
-        Writer.write_bin_prot t.writer bin_prot v ;
-        Ok ()
+        write_raw t bin_prot v ; Ok ()
 
-  let write_bin_prot_oversized t (bin_prot : 'a Core.Bin_prot.Type_class.writer)
-      v =
-    (*print_endline @@ Fmt.str "Writing oversized to %s" t.path;*)
-    let len =
-      bin_prot.size v + Bin_prot.Utils.size_header_length |> Int64.of_int
-    in
-    t.cursor <- Int64.(t.cursor + len) ;
-    Writer.write_bin_prot t.writer bin_prot v
+  let write_bin_prot_oversized t b v = write_raw t b v
+end
+
+module U : sig
+  type chain
+
+  val make_chain : unit -> chain
+
+  type accumulator
+
+  val make_accumulator : unit -> accumulator
+
+  val linearise : chain -> (unit -> unit Deferred.t) -> unit Deferred.t
+
+  val get_tl : chain -> unit Deferred.t
+
+  val accumulate : accumulator -> unit Deferred.t -> unit Deferred.t
+
+  val get_acc : accumulator -> unit Deferred.t
+end = struct
+  type chain = unit Deferred.t ref
+
+  type accumulator = unit Deferred.t ref
+
+  let make_accumulator () = ref @@ return ()
+
+  let make_chain = make_accumulator
+
+  let linearise t f =
+    let p = !t >>= f in
+    t := p ;
+    p
+
+  let get_tl t = !t
+
+  let accumulate t v =
+    let p = Deferred.all_unit [!t; v] in
+    t := p ;
+    p
+
+  let get_acc t = !t
 end
 
 module Persistant (P : Persistable) = struct
   type t =
     { default_file_size: int64
+    ; mutable state: [`Open | `Closed]
     ; mutable current_file: File.t
     ; mutable next_file: File.t Deferred.t
     ; name_gen: unit -> string
-    ; mutable next_file_queue: unit Deferred.t
-    ; mutable next_file_ready: unit Ivar.t
-    ; mutable prev_sync: unit Deferred.t }
+    ; serialisation_chain: U.chain
+    ; file_closure_chain: U.accumulator }
 
   let move_to_next_file t =
-    (*print_endline "Moving to next file" ;*)
-    let ready = t.next_file_ready in
-    t.next_file_ready <- Ivar.create () ;
+    U.accumulate t.file_closure_chain (File.close t.current_file)
+    |> don't_wait_for ;
     let%bind next_file = t.next_file in
     t.current_file <- next_file ;
-    (* Signal ready to write to next file *)
-    Ivar.fill ready () ;
     let next_name = t.name_gen () in
     t.next_file <- File.create next_name ~append:false ~len:t.default_file_size ;
     return ()
 
-  let rec write_bin_prot t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
-    match File.write_bin_prot t.current_file bin_prot v with
-    | Error `Closed ->
-      (*print_endline "Closed";*)
-        let p =
-          let%bind () = t.next_file_queue in
-          write_bin_prot t bin_prot v |> return
-        in
-        t.next_file_queue <- p ;
-        don't_wait_for p
-    | Error `OOM ->
-        (*print_endline "OOM" ;*)
-        File.write_bin_prot_oversized t.current_file bin_prot v ;
-        t.prev_sync <- Deferred.all_unit [File.close t.current_file; t.prev_sync] ;
-        let p = move_to_next_file t in
-        t.next_file_queue <- p
-    | Ok () ->
-        ()
+  exception Closed
 
-  let datasync t = 
-    (*print_endline "datasync";*)
-    Deferred.all_unit [t.prev_sync; File.datasync t.current_file]
+  let write_bin_prot t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
+    U.linearise t.serialisation_chain (fun () ->
+        match File.write_bin_prot t.current_file bin_prot v with
+        | Error `OOM ->
+            File.write_bin_prot_oversized t.current_file bin_prot v ;
+            move_to_next_file t
+        | Error `Closed ->
+            raise Closed
+        | Ok () ->
+            return ())
+    |> don't_wait_for
+
+  let datasync t =
+    (* Need to ensure that datasync is called before any further writes, so *)
+    let ivar = Ivar.create () in
+    U.linearise t.serialisation_chain (fun () ->
+        (* Ensure previous files are closed before returning *)
+        let p =
+          let%bind () =
+            Deferred.all_unit
+              [U.get_acc t.file_closure_chain; File.datasync t.current_file]
+          in
+          Ivar.fill ivar () |> return
+        in
+        p |> don't_wait_for |> return)
+    |> don't_wait_for ;
+    Ivar.read ivar
+
+  let close t =
+    match t.state with
+    | `Closed ->
+        U.get_tl t.serialisation_chain
+    | `Open ->
+        U.linearise t.serialisation_chain (fun () ->
+            let curr = File.close t.current_file in
+            let next =
+              let%bind file = t.next_file in
+              File.close file
+            in
+            U.accumulate t.file_closure_chain curr |> don't_wait_for ;
+            U.accumulate t.file_closure_chain next)
 
   let of_path path default_file_size =
     let%bind _create_dir_if_needed =
@@ -161,35 +217,13 @@ module Persistant (P : Persistable) = struct
     in
     return
       ( { name_gen
+        ; state= `Open
         ; default_file_size
         ; current_file
         ; next_file
-        ; next_file_queue= return ()
-        ; next_file_ready= Ivar.create ()
-        ; prev_sync= return () }
+        ; serialisation_chain= U.make_chain ()
+        ; file_closure_chain= U.make_accumulator () }
       , v )
 
   let write t op = write_bin_prot t P.bin_writer_op op
-
-  let close t =
-    (*print_endline "closing" ;*)
-    let curr =
-      (*print_endline "curr" ;*)
-      let%bind () = File.close t.current_file in
-      (*print_endline "closed current" ;*)
-      return ()
-    in
-    let next =
-      (*print_endline "next" ;*)
-      let%bind next = t.next_file in
-      let%bind () = File.close next in
-      (*print_endline "closed next" ;*)
-      return ()
-    in
-    let prev =
-      let%bind () = t.prev_sync in
-      (*print_endline "closed prev" ;*)
-      return ()
-    in
-    Deferred.all_unit [curr; next; prev]
 end
