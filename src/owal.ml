@@ -21,13 +21,22 @@ module File = struct
     ; writer: Async.Writer.t
     ; mutable cursor: int64
     ; mutable length: int64
-    ; mutable state: [`Open | `Closed] }
+    ; mutable state: [`Open | `Closed]
+    ; mutable sync_cursor: int64
+    ; mutable sync_promise: unit Deferred.t }
 
   let create path ~len ~append =
     let%bind writer = Writer.open_file ~append path in
     let%bind () = Unix.ftruncate (Writer.fd writer) ~len in
     let%bind () = Writer.fsync writer in
-    return {path; writer; cursor= Int64.zero; length= len; state= `Open}
+    return
+      { path
+      ; writer
+      ; cursor= Int64.zero
+      ; sync_cursor= Int64.zero
+      ; sync_promise= return ()
+      ; length= len
+      ; state= `Open }
 
   let close t =
     match t.state with
@@ -51,8 +60,13 @@ module File = struct
     match t.state with
     | `Closed ->
         Writer.close_finished t.writer
+    | `Open when Int64.(t.sync_cursor >= t.cursor) ->
+        t.sync_promise
     | `Open ->
-        Writer.fdatasync t.writer
+        t.sync_cursor <- t.cursor ;
+        let p = Writer.fdatasync t.writer in
+        t.sync_promise <- p ;
+        p
 
   let write_raw t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
     let len =
@@ -78,36 +92,17 @@ module File = struct
 end
 
 module U : sig
-  type chain
-
-  val make_chain : unit -> chain
-
   type accumulator
 
   val make_accumulator : unit -> accumulator
-
-  val linearise : chain -> (unit -> unit Deferred.t) -> unit Deferred.t
-
-  val get_tl : chain -> unit Deferred.t
 
   val accumulate : accumulator -> unit Deferred.t -> unit Deferred.t
 
   val get_acc : accumulator -> unit Deferred.t
 end = struct
-  type chain = unit Deferred.t ref
-
   type accumulator = unit Deferred.t ref
 
   let make_accumulator () = ref @@ return ()
-
-  let make_chain = make_accumulator
-
-  let linearise t f =
-    let p = !t >>= f in
-    t := p ;
-    p
-
-  let get_tl t = !t
 
   let accumulate t v =
     let p = Deferred.all_unit [!t; v] in
@@ -124,7 +119,7 @@ module Persistant (P : Persistable) = struct
     ; mutable current_file: File.t
     ; mutable next_file: File.t Deferred.t
     ; name_gen: unit -> string
-    ; serialisation_chain: U.chain
+    ; serialisation: unit Sequencer.t
     ; file_closure_chain: U.accumulator }
 
   let move_to_next_file t =
@@ -139,21 +134,25 @@ module Persistant (P : Persistable) = struct
   exception Closed
 
   let write_bin_prot t (bin_prot : 'a Core.Bin_prot.Type_class.writer) v =
-    U.linearise t.serialisation_chain (fun () ->
-        match File.write_bin_prot t.current_file bin_prot v with
-        | Error `OOM ->
-            File.write_bin_prot_oversized t.current_file bin_prot v ;
-            move_to_next_file t
-        | Error `Closed ->
-            raise Closed
-        | Ok () ->
-            return ())
-    |> don't_wait_for
+    match t.state with
+    | `Open ->
+        Throttle.enqueue t.serialisation (fun () ->
+            match File.write_bin_prot t.current_file bin_prot v with
+            | Error `OOM ->
+                File.write_bin_prot_oversized t.current_file bin_prot v ;
+                move_to_next_file t
+            | Error `Closed ->
+                assert false
+            | Ok () ->
+                return ())
+        |> don't_wait_for
+    | `Closed ->
+        raise Closed
 
   let datasync t =
     (* Need to ensure that datasync is called before any further writes, so *)
     let ivar = Ivar.create () in
-    U.linearise t.serialisation_chain (fun () ->
+    Throttle.enqueue t.serialisation (fun () ->
         (* Ensure previous files are closed before returning *)
         let p =
           let%bind () =
@@ -169,18 +168,21 @@ module Persistant (P : Persistable) = struct
   let close t =
     match t.state with
     | `Closed ->
-        U.get_tl t.serialisation_chain
+        Throttle.cleaned t.serialisation
     | `Open ->
-        U.linearise t.serialisation_chain (fun () ->
+        t.state <- `Closed ;
+        Throttle.enqueue t.serialisation (fun () ->
             let curr = File.close t.current_file in
             let next =
               let%bind file = t.next_file in
               File.close file
             in
             U.accumulate t.file_closure_chain curr |> don't_wait_for ;
-            U.accumulate t.file_closure_chain next)
+            let%bind () = U.accumulate t.file_closure_chain next in
+            Throttle.kill t.serialisation ;
+            return ())
 
-  let of_path ?(file_size = Int64.(of_int 2 ** of_int 20 * of_int 128 )) path =
+  let of_path ?(file_size = Int64.((of_int 2 ** of_int 20) * of_int 128)) path =
     let%bind _create_dir_if_needed =
       match%bind Sys.file_exists path with
       | `Yes ->
@@ -209,19 +211,15 @@ module Persistant (P : Persistable) = struct
       match res with Ok v -> read_file_loop v | Error _ -> return (v, path)
     in
     let%bind v, path = read_file_loop (P.init ()) in
-    let%bind current_file =
-      File.create path ~len:file_size ~append:false
-    in
-    let next_file =
-      File.create (name_gen ()) ~len:file_size ~append:false
-    in
+    let%bind current_file = File.create path ~len:file_size ~append:false in
+    let next_file = File.create (name_gen ()) ~len:file_size ~append:false in
     return
       ( { name_gen
         ; state= `Open
-        ; default_file_size=file_size
+        ; default_file_size= file_size
         ; current_file
         ; next_file
-        ; serialisation_chain= U.make_chain ()
+        ; serialisation= Sequencer.create ()
         ; file_closure_chain= U.make_accumulator () }
       , v )
 

@@ -14,7 +14,7 @@ end
 module Persistant (P : Persistable) : sig
   type t
 
-  val of_path : ?file_size: int64 -> string -> (t * P.t) Deferred.t
+  val of_path : ?file_size:int64 -> string -> (t * P.t) Deferred.t
 
   val write : t -> P.op -> unit
 
